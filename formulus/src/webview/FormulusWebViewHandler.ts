@@ -6,32 +6,9 @@
  * the Formulus interface and provides callbacks for specific message types.
  */
 
-import {WebViewMessageEvent, WebView} from 'react-native-webview';
-import {createFormulusMessageHandlers} from './FormulusMessageHandlers';
-import {FormInitData} from './FormulusInterfaceDefinition';
-
-// Add NodeJS type definitions
-declare global {
-  namespace NodeJS {
-    interface Timeout {}
-  }
-}
-
-// Unused interfaces removed
-// interface PendingRequest {
-//   resolve: (value: any) => void;
-//   reject: (reason?: any) => void;
-//   timeout: NodeJS.Timeout;
-// }
-
-// Unused interface - kept for potential future use
-// interface MessageHandlerContext {
-//   data: any; // This is now the payload part of the message (message content excluding type and messageId)
-//   webViewRef: React.RefObject<WebView | null>;
-//   event: WebViewMessageEvent; // Original WebView event
-//   type: string; // Original message type from the WebView message
-//   messageId?: string; // Original messageId from the WebView message, if present
-// }
+import { WebViewMessageEvent, WebView } from 'react-native-webview';
+import { createFormulusMessageHandlers } from './FormulusMessageHandlers';
+import { FormInitData } from './FormulusInterfaceDefinition';
 
 /**
  * FormulusWebViewMessageManager class
@@ -46,19 +23,24 @@ export class FormulusWebViewMessageManager {
   private isWebViewReady: boolean = false;
   private messageQueue: Array<{
     callbackName: string;
-    data: any;
-    resolve: (value: any) => void;
-    reject: (reason?: any) => void;
+    data: unknown;
+    resolve: (value: unknown) => void;
+    reject: (reason?: unknown) => void;
   }> = [];
   private pendingRequests: Map<
     string,
     {
-      resolve: (value: any) => void;
-      reject: (reason?: any) => void;
-      timeout: NodeJS.Timeout;
+      callbackName: string;
+      data: unknown;
+      resolve: (value: unknown) => void;
+      reject: (reason?: unknown) => void;
+      timeout: number;
     }
   > = new Map();
   private nativeSideHandlers: ReturnType<typeof createFormulusMessageHandlers>;
+  private formInitRetryCount = 0;
+  private static readonly FORM_INIT_MAX_RETRIES = 12; // 12 * 500ms = 6 seconds
+  private formInitRetryTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     webViewRef: React.RefObject<WebView | null>,
@@ -68,34 +50,28 @@ export class FormulusWebViewMessageManager {
     this.appName = appName;
     this.logPrefix = `[${this.appName}]`;
     this.nativeSideHandlers = createFormulusMessageHandlers(); // Initialize native handlers
-    console.log(`${this.logPrefix} FormulusWebViewMessageManager initialized`);
   }
 
   public setWebViewReady(isReady: boolean): void {
     this.isWebViewReady = isReady;
-    console.log(`${this.logPrefix} WebView readiness set to: ${isReady}`);
-    if (isReady) {
-      console.log(
-        `${this.logPrefix} WebView is ready, processing any queued messages (count=${this.messageQueue.length})`,
-      );
-      this.processMessageQueue();
-    }
+    if (isReady) this.processMessageQueue();
   }
 
-  private queueMessage(
+  private queueMessage<T>(
     callbackName: string,
-    data: any,
-    resolve: (value: any) => void,
-    reject: (reason?: any) => void,
+    data: unknown,
+    resolve: (value: T | PromiseLike<T>) => void,
+    reject: (reason?: unknown) => void,
   ): void {
-    console.log(`${this.logPrefix} Queuing message: ${callbackName}`, data);
-    this.messageQueue.push({callbackName, data, resolve, reject});
+    this.messageQueue.push({
+      callbackName,
+      data,
+      resolve: resolve as (value: unknown) => void,
+      reject,
+    });
   }
 
   private processMessageQueue(): void {
-    console.log(
-      `${this.logPrefix} Processing ${this.messageQueue.length} queued messages`,
-    );
     while (this.messageQueue.length > 0) {
       const message = this.messageQueue.shift();
       if (message) {
@@ -108,7 +84,7 @@ export class FormulusWebViewMessageManager {
 
   private sendToWebViewInternal(
     callbackName: string,
-    data: any = {},
+    data: unknown = {},
     requestId: string,
   ): void {
     if (!this.webViewRef.current) {
@@ -125,9 +101,6 @@ export class FormulusWebViewMessageManager {
     }
     const script = `
       (function() {
-        console.debug("[${
-          this.appName
-        }] Injecting script for callback ${callbackName}, requestId ${requestId}");
         try {
           if (window.${callbackName}) {
             Promise.resolve(window.${callbackName}(${JSON.stringify(data)}))
@@ -151,20 +124,12 @@ export class FormulusWebViewMessageManager {
       })();
       true; // Return true to prevent iOS warning
     `;
-    console.log(
-      `${this.logPrefix} Sending to WebView (${callbackName}, ${requestId}):`,
-      data,
-    );
     this.webViewRef.current.injectJavaScript(script);
   }
 
-  public send<T = void>(callbackName: string, data: any = {}): Promise<T> {
+  public send<T = void>(callbackName: string, data: unknown = {}): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       if (!this.isWebViewReady) {
-        console.log(
-          `${this.logPrefix} WebView not ready, queuing message for callback ${callbackName}`,
-          data,
-        );
         this.queueMessage(callbackName, data, resolve, reject);
         return;
       }
@@ -183,7 +148,13 @@ export class FormulusWebViewMessageManager {
         }
       }, FormulusWebViewMessageManager.REQUEST_TIMEOUT);
 
-      this.pendingRequests.set(requestId, {resolve, reject, timeout});
+      this.pendingRequests.set(requestId, {
+        callbackName,
+        data,
+        resolve: resolve as (value: unknown) => void,
+        reject,
+        timeout,
+      });
       this.sendToWebViewInternal(callbackName, data, requestId);
     });
   }
@@ -191,7 +162,7 @@ export class FormulusWebViewMessageManager {
   public handleWebViewMessage = (event: WebViewMessageEvent): void => {
     try {
       const eventData = JSON.parse(event.nativeEvent.data);
-      const {type, messageId, ...payload} = eventData;
+      const { type, messageId, ...payload } = eventData;
 
       if (!type) {
         console.warn(
@@ -203,6 +174,13 @@ export class FormulusWebViewMessageManager {
 
       if (type === 'formplayerReadyToReceiveInit') {
         this.handleReadySignal(payload);
+      } else if (type === 'onFormulusReady') {
+        // Injection script sends onFormulusReady when API is injected (runs before
+        // formplayer mounts). Formplayer sends formplayerReadyToReceiveInit when ready.
+        // Treat onFormulusReady as fallback: delay so formplayer React app can load
+        // and mount (register window.onFormInit) before we process the queued form init.
+        const delayMs = 1200;
+        setTimeout(() => this.handleReadySignal(payload), delayMs);
       } else if (type === 'response') {
         const actualRequestId = messageId || payload.requestId;
         if (actualRequestId) {
@@ -215,26 +193,44 @@ export class FormulusWebViewMessageManager {
         }
       } else if (type.startsWith('console.')) {
         const logLevel = type.substring('console.'.length) as keyof Console;
-        const logArgs = payload.args || []; // payload is {args: Array(1)}
-        if (typeof console[logLevel] === 'function') {
-          (console[logLevel] as (...data: any[]) => void)(
-            `${this.logPrefix} [WebView]`,
-            ...logArgs,
-          );
-        } else {
-          // Fallback if the extracted level is not a valid console method
-          console.log(`${this.logPrefix} [WebView]`, ...logArgs);
+        // Ensure logArgs is always a valid array
+        const logArgs = Array.isArray(payload.args)
+          ? payload.args
+          : payload.args !== undefined
+            ? [payload.args]
+            : [payload];
+
+        try {
+          const consoleMethod = console[logLevel];
+          if (typeof consoleMethod === 'function') {
+            // Use Function.prototype.call to ensure proper binding
+            consoleMethod.call(
+              console,
+              `${this.logPrefix} [WebView]`,
+              ...logArgs,
+            );
+          } else {
+            // Fallback if the extracted level is not a valid console method
+            console.log.call(
+              console,
+              `${this.logPrefix} [WebView]`,
+              ...logArgs,
+            );
+          }
+        } catch {
+          // If logging fails, silently ignore to prevent cascading errors
+          // This can happen if console methods are not properly available
         }
       } else if (type === 'console') {
         // Keep existing handler for type === 'console' as fallback
         // Handle console messages from WebView if type is exactly 'console' and level is in payload
-        const {level, args} = payload;
+        const { level, args } = payload;
         if (
           level &&
           args &&
           typeof console[level as keyof Console] === 'function'
         ) {
-          (console[level as keyof Console] as (...data: any[]) => void)(
+          (console[level as keyof Console] as (...data: unknown[]) => void)(
             `${this.logPrefix} [WebView]`,
             ...args,
           );
@@ -253,8 +249,7 @@ export class FormulusWebViewMessageManager {
     }
   };
 
-  private handleReadySignal(data?: any): void {
-    console.log(`${this.logPrefix} WebView is ready.`, data || '');
+  private handleReadySignal(_data?: unknown): void {
     this.setWebViewReady(true);
     // Optionally call native-side handler if it exists for onFormulusReady
     if (this.nativeSideHandlers.onFormulusReady) {
@@ -270,7 +265,6 @@ export class FormulusWebViewMessageManager {
   }
 
   public handleReceiveFocus(): void {
-    console.log(`${this.logPrefix} WebView is receiving focus.`);
     // Optionally call native-side handler if it exists for onReceiveFocus
     if (this.nativeSideHandlers.onReceiveFocus) {
       try {
@@ -284,7 +278,11 @@ export class FormulusWebViewMessageManager {
     }
   }
 
-  private handleResponse(messageId: string, result: any, error?: any): void {
+  private handleResponse(
+    messageId: string,
+    result: unknown,
+    error?: unknown,
+  ): void {
     const pendingRequest = this.pendingRequests.get(messageId);
     if (!pendingRequest) {
       console.warn(
@@ -294,36 +292,69 @@ export class FormulusWebViewMessageManager {
       return;
     }
     clearTimeout(pendingRequest.timeout as unknown as number); // Cast to number for clearTimeout
+    this.pendingRequests.delete(messageId);
+
     if (error) {
+      const errorStr = String(error);
+      // Form init was sent before formplayer registered window.onFormInit.
+      // Re-queue so formplayerReadyToReceiveInit can deliver it when formplayer mounts.
+      if (
+        errorStr.includes('Callback onFormInit not found') &&
+        pendingRequest.callbackName === 'onFormInit'
+      ) {
+        this.formInitRetryCount += 1;
+        if (
+          this.formInitRetryCount >
+          FormulusWebViewMessageManager.FORM_INIT_MAX_RETRIES
+        ) {
+          console.error(
+            `${this.logPrefix} Form init failed after ${this.formInitRetryCount} retries. Formplayer may not have loaded.`,
+          );
+          pendingRequest.reject(
+            new Error(
+              'Formplayer did not load in time. Please close and try again.',
+            ),
+          );
+          this.formInitRetryCount = 0;
+          return;
+        }
+        this.queueMessage(
+          pendingRequest.callbackName,
+          pendingRequest.data,
+          pendingRequest.resolve,
+          pendingRequest.reject,
+        );
+        // Schedule retry - formplayer may mount later
+        this.formInitRetryTimeout = setTimeout(() => {
+          this.formInitRetryTimeout = null;
+          this.processMessageQueue();
+        }, 500);
+        return;
+      }
       console.error(
         `${this.logPrefix} Received error for request ${messageId}:`,
         error,
       );
-      pendingRequest.reject(new Error(String(error)));
+      pendingRequest.reject(new Error(errorStr));
     } else {
-      console.log(
-        `${this.logPrefix} Received result for request ${messageId}:`,
-        result,
-      );
+      if (pendingRequest.callbackName === 'onFormInit') {
+        this.formInitRetryCount = 0;
+      }
       pendingRequest.resolve(result);
     }
-    this.pendingRequests.delete(messageId);
   }
 
   private async handleIncomingAction(
     type: string,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     data: any,
     messageId?: string,
   ): Promise<void> {
-    console.log(
-      `${this.logPrefix} Handling incoming action: type=${type}, messageId=${messageId}`,
-      data,
-    );
     const handlerName = `on${
       type.charAt(0).toUpperCase() + type.slice(1)
     }` as keyof typeof this.nativeSideHandlers;
-    let result: any;
-    let error: any;
+    let result: unknown;
+    let error: unknown;
 
     try {
       // Special-case WebView messages of type 'onFormulusReady'. These already
@@ -335,6 +366,7 @@ export class FormulusWebViewMessageManager {
       ) {
         result = await this.nativeSideHandlers.onFormulusReady();
       } else if (typeof this.nativeSideHandlers[handlerName] === 'function') {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
         result = await (this.nativeSideHandlers[handlerName] as Function)(data);
       } else if (this.nativeSideHandlers.onUnknownMessage) {
         console.warn(
@@ -369,11 +401,6 @@ export class FormulusWebViewMessageManager {
         error: error,
       };
 
-      console.log(
-        `${this.logPrefix} Sending response for incoming action ${type} (messageId: ${messageId}):`,
-        responsePayload,
-      );
-
       // Directly post a message to the webview, which will be caught by the event listeners
       // in FormulusInjectionScript.js
       this.webViewRef.current?.injectJavaScript(
@@ -384,9 +411,11 @@ export class FormulusWebViewMessageManager {
   }
 
   public reset(): void {
-    console.log(
-      `${this.logPrefix} Resetting FormulusWebViewMessageManager state.`,
-    );
+    if (this.formInitRetryTimeout) {
+      clearTimeout(this.formInitRetryTimeout);
+      this.formInitRetryTimeout = null;
+    }
+    this.formInitRetryCount = 0;
     this.pendingRequests.forEach(request => {
       clearTimeout(request.timeout as unknown as number); // Cast to number
       request.reject(new Error('WebViewMessageManager reset'));
@@ -394,7 +423,6 @@ export class FormulusWebViewMessageManager {
     this.pendingRequests.clear();
     this.messageQueue = [];
     this.isWebViewReady = false;
-    console.log(`${this.logPrefix} State reset complete.`);
   }
 
   // Convenience methods for common actions (can be added in Phase 2/3)
@@ -402,24 +430,10 @@ export class FormulusWebViewMessageManager {
     if (!formData.formType) {
       throw new Error('Form type is required for form init');
     }
-    console.log(
-      `${this.logPrefix} sendFormInit called for formType='${formData.formType}', isWebViewReady=${this.isWebViewReady}`,
-    );
-    if (!this.isWebViewReady) {
-      console.log(
-        `${this.logPrefix} Form init will be queued until WebView is ready`,
-        formData,
-      );
-    }
-    console.log(
-      `${this.logPrefix} Sending form init now (or queuing via send):`,
-      formData.formType,
-    );
     return this.send<void>('onFormInit', formData);
   }
 
-  public sendAttachmentData(attachmentData: any): Promise<void> {
-    console.log(`${this.logPrefix} Sending attachment data.`);
+  public sendAttachmentData(attachmentData: unknown): Promise<void> {
     return this.send<void>('onAttachmentData', attachmentData);
   }
 }

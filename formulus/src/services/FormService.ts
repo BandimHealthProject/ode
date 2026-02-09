@@ -1,4 +1,4 @@
-import {databaseService} from '../database/DatabaseService';
+import { databaseService } from '../database/DatabaseService';
 import {
   Observation,
   NewObservationInput,
@@ -14,8 +14,9 @@ export interface FormSpec {
   name: string;
   description: string;
   schemaVersion: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   schema: any;
-  uiSchema: any;
+  uiSchema: unknown;
 }
 
 /**
@@ -58,7 +59,7 @@ export class FormService {
       return null;
     }
     console.log('Loading form spec:', formDir.path);
-    let schema: any;
+    let schema: unknown;
     try {
       const filePath = formDir.path + '/schema.json';
       const fileContent = await RNFS.readFile(filePath, 'utf8');
@@ -71,7 +72,7 @@ export class FormService {
       );
       return null;
     }
-    let uiSchema: any;
+    let uiSchema: unknown;
     try {
       const uiSchemaPath = formDir.path + '/ui.json';
       const uiSchemaContent = await RNFS.readFile(uiSchemaPath, 'utf8');
@@ -96,53 +97,53 @@ export class FormService {
 
   private async getFormspecsFromStorage(): Promise<FormSpec[]> {
     try {
-      const formSpecsDir = RNFS.DocumentDirectoryPath + '/forms';
+      // Support both bundle structures:
+      // - Root-level forms/ (e.g. ODE testdata)
+      // - app/forms/ (e.g. AnthroCollect bundles)
+      const formsDirs = [
+        RNFS.DocumentDirectoryPath + '/forms',
+        RNFS.DocumentDirectoryPath + '/app/forms',
+      ];
 
-      // Check if forms directory exists, if not create it
-      const dirExists = await RNFS.exists(formSpecsDir);
-      if (!dirExists) {
-        console.log(
-          'FormService: Forms directory does not exist, creating it...',
+      const allFormSpecs: FormSpec[] = [];
+      const seenIds = new Set<string>();
+
+      for (const formSpecsDir of formsDirs) {
+        const dirExists = await RNFS.exists(formSpecsDir);
+        if (!dirExists) {
+          continue;
+        }
+
+        const formSpecFolders = await RNFS.readDir(formSpecsDir);
+        // Skip non-form directories (e.g. extensions/, .hidden)
+        const formDirs = formSpecFolders.filter(
+          f =>
+            f.isDirectory() &&
+            !f.name.startsWith('.') &&
+            f.name !== 'extensions',
         );
-        await RNFS.mkdir(formSpecsDir);
-        console.log(
-          'FormService: No forms available yet - directory created for future downloads',
-        );
-        return [];
+
+        for (const formDir of formDirs) {
+          if (seenIds.has(formDir.name)) continue;
+          const spec = await this.loadFormspec(formDir);
+          if (spec) {
+            allFormSpecs.push(spec);
+            seenIds.add(spec.id);
+          }
+        }
       }
 
-      const formSpecFolders = await RNFS.readDir(formSpecsDir);
+      // Ensure root forms dir exists for future downloads
+      const rootFormsDir = RNFS.DocumentDirectoryPath + '/forms';
+      const rootExists = await RNFS.exists(rootFormsDir);
+      if (!rootExists) {
+        await RNFS.mkdir(rootFormsDir);
+      }
+
       console.log(
-        'FormSpec folders:',
-        formSpecFolders.map(f => f.name),
+        `FormService: Successfully loaded ${allFormSpecs.length} form specs`,
       );
-
-      if (formSpecFolders.length === 0) {
-        console.log(
-          'FormService: Forms directory is empty - no forms available yet',
-        );
-        return [];
-      }
-
-      const formSpecs = await Promise.all(
-        formSpecFolders.map(async formDir => {
-          return this.loadFormspec(formDir);
-        }),
-      );
-
-      const validFormSpecs = formSpecs.filter((s): s is FormSpec => s !== null);
-      const errorCount = formSpecFolders.length - validFormSpecs.length;
-
-      if (errorCount > 0) {
-        console.warn(
-          `FormService: ${errorCount} form specs did not load correctly!`,
-        );
-      }
-
-      console.log(
-        `FormService: Successfully loaded ${validFormSpecs.length} form specs`,
-      );
-      return validFormSpecs;
+      return allFormSpecs;
     } catch (error) {
       console.error(
         'FormService: Failed to load form types from storage:',
@@ -260,6 +261,123 @@ export class FormService {
   }
 
   /**
+   * Get observations with optional WHERE clause filtering (for dynamic choice lists).
+   * Filters by data.field = 'value' conditions. age_from_dob() is handled in formplayer.
+   */
+  public async getObservationsByQuery(options: {
+    formType: string;
+    isDraft?: boolean;
+    includeDeleted?: boolean;
+    whereClause?: string | null;
+  }): Promise<Observation[]> {
+    const localRepo = databaseService.getLocalRepo();
+    let observations = await localRepo.getObservationsByFormType(
+      options.formType,
+    );
+
+    if (options.whereClause && options.whereClause.trim()) {
+      observations = this.filterObservationsByWhereClause(
+        observations,
+        options.whereClause,
+      );
+    }
+
+    return observations;
+  }
+
+  /**
+   * Filter observations by WHERE clause.
+   * Supports both formats (for compatibility with builtinExtensions and queryHelpers):
+   * - data.field = 'value' (builtinExtensions)
+   * - json_extract(data, '$.field') = 'value' (queryHelpers / AnthroCollect)
+   * Skips age_from_dob() conditions (handled in formplayer).
+   */
+  private filterObservationsByWhereClause(
+    observations: Observation[],
+    whereClause: string,
+  ): Observation[] {
+    type Cond = { field: string; operator: string; value: string };
+    const conditions: Cond[] = [];
+
+    // Pattern 1: data.field = 'value' or data.field != 'value' (builtinExtensions)
+    const dataFieldRegex =
+      /data\.(\w+)\s*(=|!=|<>|>=|<=|>|<)\s*'([^']*)'|data\.(\w+)\s*(=|!=|<>|>=|<=|>|<)\s*"([^"]*)"|data\.(\w+)\s*(=|!=|<>|>=|<=|>|<)\s*(\d+)/gi;
+    let match;
+    while ((match = dataFieldRegex.exec(whereClause)) !== null) {
+      const field = match[1] || match[4] || match[7];
+      const operator = (match[2] || match[5] || match[8]).replace(/<>/g, '!=');
+      const value = (match[3] || match[6] || match[9] || '').replace(
+        /''/g,
+        "'",
+      );
+      if (field) conditions.push({ field, operator, value });
+    }
+
+    // Pattern 2: json_extract(data, '$.field') = 'value' (queryHelpers)
+    const jsonExtractRegex =
+      /json_extract\s*\(\s*data\s*,\s*'\$\.(\w+)'\s*\)\s*(=|!=|<>|>=|<=|>|<)\s*'([^']*)'|json_extract\s*\(\s*data\s*,\s*'\$\.(\w+)'\s*\)\s*(=|!=|<>|>=|<=|>|<)\s*"([^"]*)"|json_extract\s*\(\s*data\s*,\s*'\$\.(\w+)'\s*\)\s*(=|!=|<>|>=|<=|>|<)\s*(\d+)/gi;
+    while ((match = jsonExtractRegex.exec(whereClause)) !== null) {
+      const field = match[1] || match[4] || match[7];
+      const operator = (match[2] || match[5] || match[8]).replace(/<>/g, '!=');
+      const value = (match[3] || match[6] || match[9] || '').replace(
+        /''/g,
+        "'",
+      );
+      if (field) conditions.push({ field, operator, value });
+    }
+
+    if (conditions.length === 0) return observations;
+
+    return observations.filter(obs => {
+      for (const cond of conditions) {
+        const obsValue = (obs.data as Record<string, unknown>)?.[cond.field];
+        const numVal = Number(obsValue);
+        const strVal = String(obsValue ?? '');
+        const condNum = Number(cond.value);
+        const isNumeric = !Number.isNaN(numVal) && !Number.isNaN(condNum);
+        let matches: boolean;
+        if (isNumeric) {
+          switch (cond.operator) {
+            case '=':
+              matches = numVal === condNum;
+              break;
+            case '!=':
+              matches = numVal !== condNum;
+              break;
+            case '>=':
+              matches = numVal >= condNum;
+              break;
+            case '<=':
+              matches = numVal <= condNum;
+              break;
+            case '>':
+              matches = numVal > condNum;
+              break;
+            case '<':
+              matches = numVal < condNum;
+              break;
+            default:
+              matches = strVal === cond.value;
+          }
+        } else {
+          switch (cond.operator) {
+            case '=':
+              matches = strVal === cond.value;
+              break;
+            case '!=':
+              matches = strVal !== cond.value;
+              break;
+            default:
+              matches = false;
+          }
+        }
+        if (!matches) return false;
+      }
+      return true;
+    });
+  }
+
+  /**
    * Delete an observation by its ID
    * @param observationId ID of the observation to delete
    * @returns Promise that resolves when the observation is deleted
@@ -277,7 +395,7 @@ export class FormService {
    */
   public async addNewObservation(
     formType: string,
-    data: Record<string, any>,
+    data: Record<string, unknown>,
   ): Promise<string> {
     const input: NewObservationInput = {
       formType,
@@ -305,7 +423,7 @@ export class FormService {
    */
   public async updateObservation(
     observationId: string,
-    data: Record<string, any>,
+    data: Record<string, unknown>,
   ): Promise<string> {
     const input: UpdateObservationInput = {
       observationId: observationId,
@@ -323,42 +441,6 @@ export class FormService {
     const localRepo = databaseService.getLocalRepo();
     await localRepo.updateObservation(input);
     return input.observationId;
-  }
-
-  /**
-   * Reset the database by deleting all observations
-   * @returns Promise that resolves when the database is reset
-   */
-  public async resetDatabase(): Promise<void> {
-    const localRepo = databaseService.getLocalRepo();
-    if (!localRepo) {
-      throw new Error('Database repository is not available');
-    }
-
-    try {
-      // Get all observations across all form types
-      const allFormSpecs = this.getFormSpecs();
-      let allObservations: any[] = [];
-
-      for (const formSpec of allFormSpecs) {
-        const observations = await localRepo.getObservationsByFormType(
-          formSpec.id,
-        );
-        allObservations = [...allObservations, ...observations];
-      }
-
-      // Delete each observation
-      for (const observation of allObservations) {
-        await localRepo.deleteObservation(observation.id);
-      }
-
-      console.log(
-        `Database reset complete. Deleted ${allObservations.length} observations.`,
-      );
-    } catch (error) {
-      console.error('Error resetting database:', error);
-      throw error;
-    }
   }
 
   /**
@@ -382,14 +464,14 @@ export class FormService {
       // Create a test observation with person form type
       const testId1 = await localRepo.saveObservation({
         formType: 'person',
-        data: {test: 'data1'},
+        data: { test: 'data1' },
       });
       console.log('Created test observation 1:', testId1);
 
       // Create another test observation with a different form type
       const testId2 = await localRepo.saveObservation({
         formType: 'test_form',
-        data: {test: 'data2'},
+        data: { test: 'data2' },
       });
       console.log('Created test observation 2:', testId2);
 

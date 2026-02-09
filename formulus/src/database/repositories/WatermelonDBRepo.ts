@@ -1,16 +1,16 @@
-import {Database, Q, Collection} from '@nozbe/watermelondb';
-import {ObservationModel} from '../models/ObservationModel';
-import {LocalRepoInterface} from './LocalRepoInterface';
+import { Database, Q, Collection } from '@nozbe/watermelondb';
+import { ObservationModel } from '../models/ObservationModel';
+import { LocalRepoInterface } from './LocalRepoInterface';
 import {
   Observation,
   NewObservationInput,
   UpdateObservationInput,
 } from '../models/Observation';
-import {ObservationMapper} from '../../mappers/ObservationMapper';
-import {geolocationService} from '../../services/GeolocationService';
-import {ToastService} from '../../services/ToastService';
-import {clientIdService} from '../../services/ClientIdService';
-import {getUserInfo} from '../../api/synkronus/Auth';
+import { ObservationMapper } from '../../mappers/ObservationMapper';
+import { geolocationService } from '../../services/GeolocationService';
+import { ToastService } from '../../services/ToastService';
+import { clientIdService } from '../../services/ClientIdService';
+import { getUserInfo } from '../../api/synkronus/Auth';
 
 /**
  * WatermelonDB implementation of the LocalRepoInterface
@@ -68,7 +68,9 @@ export class WatermelonDBRepo implements LocalRepoInterface {
           const user = await getUserInfo();
           author = user?.username ?? '';
         }
-      } catch {}
+      } catch (error) {
+        console.error('Error capturing author', error);
+      }
       const deviceId: string =
         input.deviceId ?? (await clientIdService.getClientId());
 
@@ -197,7 +199,14 @@ export class WatermelonDBRepo implements LocalRepoInterface {
    */
   async getObservationsByFormType(formId: string): Promise<Observation[]> {
     try {
-      console.log('Fetching observations for form type ID:', formId);
+      // Validate formId parameter
+      if (!formId || typeof formId !== 'string' || formId.trim() === '') {
+        console.warn(
+          'Invalid formId provided to getObservationsByFormType:',
+          formId,
+        );
+        return [];
+      }
 
       // First, let's check all observations in the database for debugging
       const allObservations = await this.observationsCollection.query().fetch();
@@ -207,10 +216,6 @@ export class WatermelonDBRepo implements LocalRepoInterface {
       const observations = await this.observationsCollection
         .query(Q.where('form_type', formId))
         .fetch();
-
-      console.log(
-        `Found ${observations.length} total observations for form type: ${formId}`,
-      );
 
       return observations.map(observation =>
         this.mapObservationModelToInterface(observation),
@@ -416,7 +421,7 @@ export class WatermelonDBRepo implements LocalRepoInterface {
       return 0;
     }
 
-    var count = await this.database.write(async () => {
+    const count = await this.database.write(async () => {
       const existingRecords = await this.observationsCollection
         .query(
           Q.where('observation_id', Q.oneOf(changes.map(c => c.observationId))),
@@ -444,11 +449,11 @@ export class WatermelonDBRepo implements LocalRepoInterface {
                 : JSON.stringify(change.data);
             record.deleted = change.deleted ?? record.deleted;
             // Set optional metadata if provided
-            if ((change as any).author !== undefined) {
-              (record as any).author = (change as any).author ?? '';
+            if (change.author !== undefined) {
+              record.author = change.author ?? '';
             }
-            if ((change as any).deviceId !== undefined) {
-              (record as any).deviceId = (change as any).deviceId ?? '';
+            if (change.deviceId !== undefined) {
+              record.deviceId = change.deviceId ?? '';
             }
             record.syncedAt = new Date();
           });
@@ -464,8 +469,8 @@ export class WatermelonDBRepo implements LocalRepoInterface {
               typeof change.data === 'string'
                 ? change.data
                 : JSON.stringify(change.data);
-            (record as any).author = (change as any).author ?? '';
-            (record as any).deviceId = (change as any).deviceId ?? '';
+            record.author = change.author ?? '';
+            record.deviceId = change.deviceId ?? '';
             record.deleted = change.deleted ?? false;
             record.syncedAt = new Date();
           });
@@ -586,7 +591,6 @@ export class WatermelonDBRepo implements LocalRepoInterface {
   // Helper method to map WatermelonDB model to our interface
   private mapObservationModelToInterface(model: ObservationModel): Observation {
     const parsedData = model.getParsedData();
-    console.log(`Mapping model to interface. ID: ${model.id}`);
 
     // Parse geolocation data if available
     let geolocation = null;
@@ -608,8 +612,8 @@ export class WatermelonDBRepo implements LocalRepoInterface {
       syncedAt: model.syncedAt,
       deleted: model.deleted,
       geolocation,
-      author: (model as any).author ?? null,
-      deviceId: (model as any).deviceId ?? null,
+      author: model.author ?? null,
+      deviceId: model.deviceId ?? null,
     };
   }
 }
