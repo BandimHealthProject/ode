@@ -1,7 +1,7 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { withJsonFormsControlProps } from '@jsonforms/react';
 import { ControlProps, rankWith, schemaTypeIs, and, schemaMatches } from '@jsonforms/core';
-import { TextField, Box, Typography, Alert, Button } from '@mui/material';
+import { Select, MenuItem, Box, Typography, Alert, Button, FormControl, InputLabel } from '@mui/material';
 import { CalendarToday } from '@mui/icons-material';
 import QuestionShell from './QuestionShell';
 import {
@@ -38,11 +38,14 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
   const [dayUnknown, setDayUnknown] = useState<boolean>(false);
   const [monthUnknown, setMonthUnknown] = useState<boolean>(false);
   const [yearUnknown, setYearUnknown] = useState<boolean>(false);
+  const skipNextSync = useRef(true);
+  const lastWrittenData = useRef<string | null>(null);
 
-  // Initialize from data
+  // Initialize from data (skip if we wrote it ourselves)
   useEffect(() => {
+    if (data === lastWrittenData.current) return;
+    skipNextSync.current = true;
     if (data && typeof data === 'string') {
-      // Convert storage format to adate format for editing
       const adateFormat = storageFormatToAdate(data);
       if (adateFormat) {
         const upperAdate = adateFormat.toUpperCase();
@@ -64,7 +67,6 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
         }
       }
     } else {
-      // Initialize empty
       setDay('');
       setMonth('');
       setYear('');
@@ -74,64 +76,52 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
     }
   }, [data]);
 
-  // Update form data when components change
-  const updateFormData = useCallback(() => {
-    const dayValue = dayUnknown ? 'NS' : day;
-    const monthValue = monthUnknown ? 'NS' : month;
-    const yearValue = yearUnknown ? 'NS' : year;
-
-    // Build adate string
-    const adateString = `D:${dayValue},M:${monthValue},Y:${yearValue}`;
-
-    // Convert to storage format and save
-    const storageFormat = adateToStorageFormat(adateString);
-    if (storageFormat) {
-      handleChange(path, storageFormat);
-    } else {
-      handleChange(path, '');
+  // Sync form data whenever state changes
+  useEffect(() => {
+    if (skipNextSync.current) {
+      skipNextSync.current = false;
+      return;
     }
+
+    // Nothing entered yet — don't store
+    if (!day && !month && !year && !dayUnknown && !monthUnknown && !yearUnknown) {
+      lastWrittenData.current = '';
+      handleChange(path, '');
+      return;
+    }
+
+    const dayValue = dayUnknown ? 'NS' : (day || 'NS');
+    const monthValue = monthUnknown ? 'NS' : (month || 'NS');
+    const yearValue = yearUnknown ? 'NS' : (year || 'NS');
+
+    const adateString = `D:${dayValue},M:${monthValue},Y:${yearValue}`;
+    const storageFormat = adateToStorageFormat(adateString);
+    lastWrittenData.current = storageFormat || '';
+    handleChange(path, storageFormat || '');
   }, [day, month, year, dayUnknown, monthUnknown, yearUnknown, handleChange, path]);
 
   // Handle day change
   const handleDayChange = useCallback(
-    (event: React.ChangeEvent<HTMLInputElement>) => {
-      const value = event.target.value;
-      if (
-        value === '' ||
-        (/^\d+$/.test(value) && parseInt(value, 10) >= 1 && parseInt(value, 10) <= 31)
-      ) {
-        setDay(value);
-        updateFormData();
-      }
+    (event: any) => {
+      setDay(event.target.value as string);
     },
-    [updateFormData],
+    [],
   );
 
   // Handle month change
   const handleMonthChange = useCallback(
-    (event: React.ChangeEvent<HTMLInputElement>) => {
-      const value = event.target.value;
-      if (
-        value === '' ||
-        (/^\d+$/.test(value) && parseInt(value, 10) >= 1 && parseInt(value, 10) <= 12)
-      ) {
-        setMonth(value);
-        updateFormData();
-      }
+    (event: any) => {
+      setMonth(event.target.value as string);
     },
-    [updateFormData],
+    [],
   );
 
   // Handle year change
   const handleYearChange = useCallback(
-    (event: React.ChangeEvent<HTMLInputElement>) => {
-      const value = event.target.value;
-      if (value === '' || /^\d{4}$/.test(value)) {
-        setYear(value);
-        updateFormData();
-      }
+    (event: any) => {
+      setYear(event.target.value as string);
     },
-    [updateFormData],
+    [],
   );
 
   // Handle quick date buttons
@@ -148,8 +138,7 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
     setDayUnknown(false);
     setMonthUnknown(false);
     setYearUnknown(false);
-    updateFormData();
-  }, [updateFormData]);
+  }, []);
 
   const handleYesterday = useCallback(() => {
     const yesterday = yesterdayAdate();
@@ -164,8 +153,7 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
     setDayUnknown(false);
     setMonthUnknown(false);
     setYearUnknown(false);
-    updateFormData();
-  }, [updateFormData]);
+  }, []);
 
   // Don't render if not visible
   if (!visible) {
@@ -208,16 +196,19 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
         <Box sx={{ display: 'flex', gap: 2, alignItems: 'flex-start', flexWrap: 'wrap' }}>
           {/* Day */}
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 120 }}>
-            <TextField
-              label="Day"
-              value={day}
-              onChange={handleDayChange}
-              disabled={!enabled || dayUnknown}
-              type="number"
-              inputProps={{ min: 1, max: 31 }}
-              size="small"
-              fullWidth
-            />
+            <FormControl size="small" fullWidth disabled={!enabled || dayUnknown}>
+              <InputLabel>Day</InputLabel>
+              <Select
+                label="Day"
+                value={day}
+                onChange={handleDayChange}
+              >
+                <MenuItem value=""><em>--</em></MenuItem>
+                {Array.from({ length: 31 }, (_, i) => i + 1).map((d) => (
+                  <MenuItem key={d} value={String(d)}>{d}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
               <input
                 type="checkbox"
@@ -225,7 +216,6 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
                 onChange={(e) => {
                   setDayUnknown(e.target.checked);
                   if (e.target.checked) setDay('');
-                  updateFormData();
                 }}
                 disabled={!enabled}
                 style={{ cursor: enabled ? 'pointer' : 'not-allowed' }}
@@ -236,16 +226,19 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
 
           {/* Month */}
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 120 }}>
-            <TextField
-              label="Month"
-              value={month}
-              onChange={handleMonthChange}
-              disabled={!enabled || monthUnknown}
-              type="number"
-              inputProps={{ min: 1, max: 12 }}
-              size="small"
-              fullWidth
-            />
+            <FormControl size="small" fullWidth disabled={!enabled || monthUnknown}>
+              <InputLabel>Month</InputLabel>
+              <Select
+                label="Month"
+                value={month}
+                onChange={handleMonthChange}
+              >
+                <MenuItem value=""><em>--</em></MenuItem>
+                {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
+                  <MenuItem key={m} value={String(m)}>{m}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
               <input
                 type="checkbox"
@@ -253,7 +246,6 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
                 onChange={(e) => {
                   setMonthUnknown(e.target.checked);
                   if (e.target.checked) setMonth('');
-                  updateFormData();
                 }}
                 disabled={!enabled}
                 style={{ cursor: enabled ? 'pointer' : 'not-allowed' }}
@@ -264,16 +256,19 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
 
           {/* Year */}
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 120 }}>
-            <TextField
-              label="Year"
-              value={year}
-              onChange={handleYearChange}
-              disabled={!enabled || yearUnknown}
-              type="number"
-              inputProps={{ min: 1000, max: 9999 }}
-              size="small"
-              fullWidth
-            />
+            <FormControl size="small" fullWidth disabled={!enabled || yearUnknown}>
+              <InputLabel>Year</InputLabel>
+              <Select
+                label="Year"
+                value={year}
+                onChange={handleYearChange}
+              >
+                <MenuItem value=""><em>--</em></MenuItem>
+                {Array.from({ length: new Date().getFullYear() - 1899 }, (_, i) => new Date().getFullYear() - i).map((y) => (
+                  <MenuItem key={y} value={String(y)}>{y}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
               <input
                 type="checkbox"
@@ -281,7 +276,6 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
                 onChange={(e) => {
                   setYearUnknown(e.target.checked);
                   if (e.target.checked) setYear('');
-                  updateFormData();
                 }}
                 disabled={!enabled}
                 style={{ cursor: enabled ? 'pointer' : 'not-allowed' }}
