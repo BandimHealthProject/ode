@@ -3,14 +3,14 @@ import { withJsonFormsControlProps } from '@jsonforms/react';
 import { ControlProps, rankWith, schemaTypeIs, and, schemaMatches } from '@jsonforms/core';
 import { Select, MenuItem, Box, Typography, Alert, Button, FormControl, InputLabel } from '@mui/material';
 import { CalendarToday } from '@mui/icons-material';
-import QuestionShell from './QuestionShell';
+import QuestionShell from '../components/QuestionShell';
 import {
   adateToStorageFormat,
   storageFormatToAdate,
   displayAdate,
   todayAdate,
   yesterdayAdate,
-} from './adateUtils';
+} from '../utils/adateUtils';
 
 // Tester function - determines when this renderer should be used
 export const adateQuestionTester = rankWith(
@@ -27,7 +27,7 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
   path,
   errors,
   schema,
-  uischema,
+  uischema: _uischema,
   enabled = true,
   visible = true,
 }) => {
@@ -42,6 +42,8 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
   const lastWrittenData = useRef<string | null>(null);
 
   // Initialize from data (skip if we wrote it ourselves)
+  // Bidirectional sync pattern: skipNextSync ref prevents cascading renders
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (data === lastWrittenData.current) return;
     skipNextSync.current = true;
@@ -75,6 +77,7 @@ const AdateQuestionRenderer: React.FC<ControlProps> = ({
       setYearUnknown(false);
     }
   }, [data]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Sync form data whenever state changes
   useEffect(() => {
